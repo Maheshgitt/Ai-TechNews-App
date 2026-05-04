@@ -178,7 +178,7 @@ async def chat(req: ChatRequest):
     """
     news_context = ""
     if req.include_news_context:
-    cached = load_cache()
+       cached = load_cache()
     if cached and len(cached) > 0:
        latest = cached[-1]
        news_context = latest.get("summary", "")
