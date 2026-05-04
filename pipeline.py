@@ -466,7 +466,8 @@ def run_pipeline() -> dict:
     # If still too few, lower the bar and retry with all raw
     if len(candidates) < 4:
         log.warning(f"Only {len(candidates)} candidates — relaxing memory filter")
-        candidates = prefilter(raw, ArticleMemory.__new__(ArticleMemory))
+        memory = ArticleMemory()
+        candidates = prefilter(raw, memory)
         # init empty memory object
         empty_mem = object.__new__(ArticleMemory)
         empty_mem._data = {}
