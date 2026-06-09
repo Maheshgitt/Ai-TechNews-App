@@ -1,18 +1,21 @@
 """
-pipeline.py  v5
+pipeline.py  v6
 ───────────────
-• Push notification REMOVED from here — handled centrally in server.py
-• Fixed ArticleMemory fallback (no more broken object.__new__)
-• Perplexity-style summary
-• 24-hr memory window
+Changes vs v5:
+  • Each article now gets its own per-article summary (not just global)
+  • ai_image_url added to every article via image_gen module
+  • Summary generation and image prompt generation run in parallel
+  • Article model: title, description, summary, ai_image_url, source_url, pubDate
 """
 
 import re, json, time, hashlib, logging, os, requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from groq import Groq
 from dotenv import load_dotenv
+from image_gen import enrich_with_images   # ← new module
 
 load_dotenv()
 
@@ -23,9 +26,9 @@ client = Groq(api_key=GROQ_API_KEY)
 if not NEWS_API_KEY: raise ValueError("NEWSDATA_API_KEY missing")
 if not GROQ_API_KEY: raise ValueError("GROQ_API_KEY missing")
 
-BASE_DIR     = Path(__file__).parent
-MEMORY_FILE  = BASE_DIR / "memory" / "seen_articles.json"
-LOG_DIR      = BASE_DIR / "logs"
+BASE_DIR    = Path(__file__).parent
+MEMORY_FILE = BASE_DIR / "memory" / "seen_articles.json"
+LOG_DIR     = BASE_DIR / "logs"
 MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -42,7 +45,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("pipeline")
 
-# ── tunables ──────────────────────────────────────────────
 TARGET_ARTICLES    = 8
 MIN_SCORE          = 3
 DEDUP_RATIO        = 0.72
@@ -50,7 +52,6 @@ MEMORY_EXPIRY_DAYS = 1
 GROQ_RETRY         = 3
 GROQ_DELAY         = 2
 
-# ── keywords ──────────────────────────────────────────────
 KEYWORD_WEIGHTS: dict[str, int] = {
     "openai": 10, "gpt-5": 10, "gpt-4o": 10, "o3": 10, "o4": 10,
     "chatgpt": 9, "dall-e": 8, "sora": 9,
@@ -113,7 +114,7 @@ SOURCE_SCORES: dict[str, int] = {
 
 
 # ══════════════════════════════════════════════════════════
-# MEMORY  (24-hr window)
+# MEMORY
 # ══════════════════════════════════════════════════════════
 class ArticleMemory:
     def __init__(self, path: Path = MEMORY_FILE, empty: bool = False):
@@ -181,7 +182,6 @@ def fetch_news() -> list[dict]:
             log.info(f"Fetched {len(articles)} from category={cat}")
         except Exception as e:
             log.error(f"Fetch error ({cat}): {e}")
-
     log.info(f"Total raw articles: {len(all_articles)}")
     return all_articles
 
@@ -234,12 +234,10 @@ def prefilter(articles: list[dict], memory: ArticleMemory) -> list[dict]:
 # LLM CLASSIFIER
 # ══════════════════════════════════════════════════════════
 CLASSIFIER_SYSTEM = f"""
-You are a strict tech news classifier for software/hardware engineers.
-Select the top {TARGET_ARTICLES} most impactful articles.
-Prioritise: AI model releases, hardware, robotics, cybersecurity, open-source.
-Reject: pure finance, celebrity, generic PR.
-Return ONLY valid JSON, no markdown, no preamble:
-{{"selected": [1, 2, 5, ...]}}
+You are a strict tech news classifier. Select the top {TARGET_ARTICLES} most
+impactful articles. Prioritise: AI models, hardware, robotics, cybersecurity,
+open-source. Reject: finance, celebrity, generic PR.
+Return ONLY valid JSON: {{"selected": [1, 2, 5, ...]}}
 """.strip()
 
 def llm_classify(candidates: list[dict]) -> list[dict]:
@@ -270,46 +268,67 @@ def llm_classify(candidates: list[dict]) -> list[dict]:
             log.warning(f"Classifier attempt {attempt} failed: {e}")
             if attempt < GROQ_RETRY:
                 time.sleep(GROQ_DELAY)
-
-    log.warning("Classifier failed — using top keyword-scored articles.")
     return candidates[:TARGET_ARTICLES]
 
 
 # ══════════════════════════════════════════════════════════
-# SUMMARY  — Perplexity-style
+# PER-ARTICLE SUMMARY
+# ══════════════════════════════════════════════════════════
+ARTICLE_SUMMARY_SYSTEM = """
+Write a 3-sentence factual technical summary of this article for engineers.
+Include: what happened, key specs/numbers if available, real-world significance.
+No fluff. Return ONLY the summary text.
+"""
+
+def _summarise_one(article: dict) -> str:
+    """Generate a short per-article summary via Groq."""
+    title = article.get("title", "")
+    desc  = article.get("description", "") or ""
+    user_msg = f"Title: {title}\nDescription: {desc[:400]}"
+    try:
+        res = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": ARTICLE_SUMMARY_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=200,
+        )
+        return res.choices[0].message.content.strip()
+    except Exception as e:
+        log.warning(f"Article summary failed for '{title[:40]}': {e}")
+        return desc[:300]   # fallback to raw description
+
+
+# ══════════════════════════════════════════════════════════
+# GLOBAL SUMMARY  (Perplexity-style digest)
 # ══════════════════════════════════════════════════════════
 SUMMARY_SYSTEM = """
-You are an AI tech analyst writing for senior engineers and researchers.
-Write like Perplexity AI — dense, factual, source-cited, no fluff.
-
-Format EXACTLY like this:
+You are an AI tech analyst writing for senior engineers. Write like Perplexity AI.
 
 ## Today's Signal
-**[One sharp sentence: the dominant theme]**
+**[One sharp sentence: dominant theme]**
 
 ---
 
 ## Top Stories
 
-### 1. [Article Title]
+### N. [Article Title]
 **Category:** AI Model | Hardware | Cybersecurity | Robotics | Quantum | Regulation | Tools
-**Source:** [domain name only]
+**Source:** [domain only]
 
-[2–3 sentence factual summary with model names, benchmark numbers, specs where available.]
+[2–3 sentence factual summary with specs, benchmark numbers where available.]
 
-**Why it matters:** [1 sentence — engineering significance only]
-
----
-
-[repeat for each article]
+**Why it matters:** [1 sentence engineering significance]
 
 ---
 
 ## Key Takeaways
 - [Most important technical development]
 - [Second most important]
-- [Trend or pattern across today's stories]
-- [What engineers/builders should watch]
+- [Cross-story trend]
+- [What engineers should watch]
 
 ## Signal Strength
 **Verdict:** 🟢 Strong Signal | 🟡 Mixed | 🔴 Mostly Noise
@@ -319,12 +338,12 @@ Format EXACTLY like this:
 *{n} stories · {date}*
 """
 
-def generate_summary(articles: list[dict]) -> str:
+def generate_global_summary(articles: list[dict]) -> str:
     n = len(articles)
     news_block = "\n\n".join(
-        f"{i}. TITLE: {a.get('title', 'N/A')}\n"
+        f"{i}. TITLE: {a.get('title','N/A')}\n"
         f"   DESC: {(a.get('description') or 'N/A')[:300]}\n"
-        f"   SOURCE: {a.get('source_url') or a.get('link', 'N/A')}"
+        f"   SOURCE: {a.get('source_url') or a.get('link','N/A')}"
         for i, a in enumerate(articles, 1)
     )
     system = SUMMARY_SYSTEM.replace("{n}", str(n)).replace(
@@ -336,20 +355,20 @@ def generate_summary(articles: list[dict]) -> str:
                 model="llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": system},
-                    {"role": "user",   "content": f"Analyse these {n} articles:\n\n{news_block}"},
+                    {"role": "user",   "content": f"Analyse {n} articles:\n\n{news_block}"},
                 ],
                 temperature=0.3,
                 max_tokens=3500,
             )
             return res.choices[0].message.content
         except Exception as e:
-            log.warning(f"Summary attempt {attempt} failed (70b): {e}")
+            log.warning(f"Global summary attempt {attempt} failed: {e}")
             try:
                 res = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=[
                         {"role": "system", "content": system},
-                        {"role": "user",   "content": f"Analyse these {n} articles:\n\n{news_block}"},
+                        {"role": "user",   "content": f"Analyse {n} articles:\n\n{news_block}"},
                     ],
                     temperature=0.3,
                     max_tokens=3000,
@@ -366,16 +385,15 @@ def generate_summary(articles: list[dict]) -> str:
 # CHATBOT
 # ══════════════════════════════════════════════════════════
 CHAT_SYSTEM = """
-You are an AI tech news assistant with deep knowledge of AI, hardware, robotics,
-and cybersecurity. You answer questions about technology concisely and accurately.
+You are an AI tech news assistant. Answer questions about technology concisely.
 If the user asks about today's news, use the context provided.
-Be direct — no filler phrases. Keep responses under 200 words unless asked for more.
+Be direct. Keep responses under 200 words unless asked for more.
 """
 
 def chat_response(messages: list[dict], news_context: str = "") -> str:
     system = CHAT_SYSTEM
     if news_context:
-        system += f"\n\nToday's full news context (all batches):\n{news_context[:4000]}"
+        system += f"\n\nToday's full news context:\n{news_context[:4000]}"
     try:
         res = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -386,62 +404,77 @@ def chat_response(messages: list[dict], news_context: str = "") -> str:
         return res.choices[0].message.content
     except Exception as e:
         log.error(f"Chat error: {e}")
-        return "Sorry, I'm having trouble responding right now. Try again in a moment."
+        return "Sorry, having trouble responding. Try again in a moment."
 
 
 # ══════════════════════════════════════════════════════════
-# MAIN PIPELINE  (returns dict — push handled by server.py)
+# MAIN PIPELINE
 # ══════════════════════════════════════════════════════════
 def run_pipeline() -> dict:
     memory = ArticleMemory()
-    log.info(f"Pipeline started. Memory: {memory.size()} seen articles.")
+    log.info(f"Pipeline v6 started. Memory: {memory.size()} articles seen.")
 
     raw = fetch_news()
     if not raw:
         return {
-            "status": "error",
-            "message": "News API returned no results.",
-            "articles": [], "summary": "",
-            "run_at": datetime.now().isoformat(),
+            "status": "error", "message": "News API returned no results.",
+            "articles": [], "summary": "", "run_at": datetime.now().isoformat(),
         }
 
     candidates = prefilter(raw, memory)
-
-    # If too few candidates, bypass memory and try again
     if len(candidates) < 4:
-        log.warning(f"Only {len(candidates)} candidates — bypassing memory filter.")
-        empty_memory = ArticleMemory(empty=True)   # ← fixed: no broken object.__new__
-        candidates   = prefilter(raw, empty_memory)
+        log.warning("Too few candidates — bypassing memory filter.")
+        candidates = prefilter(raw, ArticleMemory(empty=True))
 
     if not candidates:
         return {
-            "status": "error",
-            "message": "No relevant articles found.",
-            "articles": [], "summary": "",
-            "run_at": datetime.now().isoformat(),
+            "status": "error", "message": "No relevant articles found.",
+            "articles": [], "summary": "", "run_at": datetime.now().isoformat(),
         }
 
     selected = llm_classify(candidates)
     if not selected:
         selected = candidates[:TARGET_ARTICLES]
 
-    summary = generate_summary(selected)
-    memory.mark_batch([a.get("title", "") for a in selected])
+    # ── Parallel: per-article summaries + global digest ──
+    log.info("Generating per-article summaries in parallel...")
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        summary_futures = {
+            executor.submit(_summarise_one, a): i
+            for i, a in enumerate(selected)
+        }
+        global_future = executor.submit(generate_global_summary, selected)
 
-    log.info(f"Pipeline complete. {len(selected)} articles.")
+        for future, idx in summary_futures.items():
+            try:
+                selected[idx]["ai_summary"] = future.result()
+            except Exception as e:
+                log.warning(f"Per-article summary failed idx={idx}: {e}")
+                selected[idx]["ai_summary"] = selected[idx].get("description", "")
+
+        global_summary = global_future.result()
+
+    # ── Image enrichment (parallel inside enrich_with_images) ──
+    log.info("Enriching articles with AI-generated images...")
+    selected = enrich_with_images(selected, groq_client=client)
+
+    memory.mark_batch([a.get("title", "") for a in selected])
+    log.info(f"Pipeline v6 complete. {len(selected)} articles.")
+
     return {
         "status":        "ok",
         "run_at":        datetime.now().isoformat(),
         "article_count": len(selected),
         "articles": [
             {
-                "title":       a.get("title", ""),
-                "description": a.get("description", ""),
-                "source_url":  a.get("source_url") or a.get("link", ""),
-                "image_url":   a.get("image_url", ""),
-                "pubDate":     a.get("pubDate", ""),
+                "title":        a.get("title", ""),
+                "description":  a.get("description", ""),
+                "summary":      a.get("ai_summary", ""),
+                "ai_image_url": a.get("ai_image_url", ""),
+                "source_url":   a.get("source_url") or a.get("link", ""),
+                "pubDate":      a.get("pubDate", ""),
             }
             for a in selected
         ],
-        "summary": summary,
+        "summary": global_summary,
     }
