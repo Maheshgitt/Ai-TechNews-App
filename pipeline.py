@@ -1,11 +1,8 @@
 """
-pipeline.py  v6
+pipeline.py  v7
 ───────────────
-Changes vs v5:
-  • Each article now gets its own per-article summary (not just global)
-  • ai_image_url added to every article via image_gen module
-  • Summary generation and image prompt generation run in parallel
-  • Article model: title, description, summary, ai_image_url, source_url, pubDate
+Removed: image_gen.py, enrich_with_images(), ai_image_url
+Added:   image_url passed straight from NewsData.io response
 """
 
 import re, json, time, hashlib, logging, os, requests
@@ -15,7 +12,6 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from groq import Groq
 from dotenv import load_dotenv
-from image_gen import enrich_with_images   # ← new module
 
 load_dotenv()
 
@@ -39,7 +35,7 @@ logging.basicConfig(
         logging.StreamHandler(),
         logging.FileHandler(
             LOG_DIR / f"run_{datetime.now():%Y-%m-%d}.log",
-            encoding="utf-8"
+            encoding="utf-8",
         ),
     ],
 )
@@ -169,10 +165,10 @@ def fetch_news() -> list[dict]:
             r = requests.get(
                 "https://newsdata.io/api/1/news",
                 params={
-                    "apikey": NEWS_API_KEY,
+                    "apikey":   NEWS_API_KEY,
                     "category": cat,
                     "language": "en",
-                    "size": 10,
+                    "size":     10,
                 },
                 timeout=15,
             )
@@ -223,7 +219,6 @@ def prefilter(articles: list[dict], memory: ArticleMemory) -> list[dict]:
         if total >= MIN_SCORE:
             seen_titles.append(title)
             scored.append((total, a))
-
     scored.sort(key=lambda x: x[0], reverse=True)
     candidates = [a for _, a in scored[:25]]
     log.info(f"Pre-filter: {len(candidates)} candidates.")
@@ -258,9 +253,9 @@ def llm_classify(candidates: list[dict]) -> list[dict]:
                 temperature=0.0,
                 max_tokens=200,
             )
-            raw   = res.choices[0].message.content.strip()
-            data  = json.loads(raw)
-            idxs  = [i - 1 for i in data["selected"] if 1 <= i <= len(candidates)]
+            raw    = res.choices[0].message.content.strip()
+            data   = json.loads(raw)
+            idxs   = [i - 1 for i in data["selected"] if 1 <= i <= len(candidates)]
             result = [candidates[i] for i in idxs[:TARGET_ARTICLES]]
             log.info(f"Classifier selected {len(result)} articles.")
             return result
@@ -275,22 +270,20 @@ def llm_classify(candidates: list[dict]) -> list[dict]:
 # PER-ARTICLE SUMMARY
 # ══════════════════════════════════════════════════════════
 ARTICLE_SUMMARY_SYSTEM = """
-Write a 3-sentence factual technical summary of this article for engineers.
-Include: what happened, key specs/numbers if available, real-world significance.
+Write a 3-sentence factual technical summary for engineers.
+Include: what happened, key specs/numbers if available, significance.
 No fluff. Return ONLY the summary text.
 """
 
 def _summarise_one(article: dict) -> str:
-    """Generate a short per-article summary via Groq."""
     title = article.get("title", "")
     desc  = article.get("description", "") or ""
-    user_msg = f"Title: {title}\nDescription: {desc[:400]}"
     try:
         res = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": ARTICLE_SUMMARY_SYSTEM},
-                {"role": "user",   "content": user_msg},
+                {"role": "user",   "content": f"Title: {title}\nDescription: {desc[:400]}"},
             ],
             temperature=0.2,
             max_tokens=200,
@@ -298,11 +291,11 @@ def _summarise_one(article: dict) -> str:
         return res.choices[0].message.content.strip()
     except Exception as e:
         log.warning(f"Article summary failed for '{title[:40]}': {e}")
-        return desc[:300]   # fallback to raw description
+        return desc[:300]
 
 
 # ══════════════════════════════════════════════════════════
-# GLOBAL SUMMARY  (Perplexity-style digest)
+# GLOBAL SUMMARY
 # ══════════════════════════════════════════════════════════
 SUMMARY_SYSTEM = """
 You are an AI tech analyst writing for senior engineers. Write like Perplexity AI.
@@ -341,9 +334,9 @@ You are an AI tech analyst writing for senior engineers. Write like Perplexity A
 def generate_global_summary(articles: list[dict]) -> str:
     n = len(articles)
     news_block = "\n\n".join(
-        f"{i}. TITLE: {a.get('title','N/A')}\n"
+        f"{i}. TITLE: {a.get('title', 'N/A')}\n"
         f"   DESC: {(a.get('description') or 'N/A')[:300]}\n"
-        f"   SOURCE: {a.get('source_url') or a.get('link','N/A')}"
+        f"   SOURCE: {a.get('source_url') or a.get('link', 'N/A')}"
         for i, a in enumerate(articles, 1)
     )
     system = SUMMARY_SYSTEM.replace("{n}", str(n)).replace(
@@ -386,8 +379,7 @@ def generate_global_summary(articles: list[dict]) -> str:
 # ══════════════════════════════════════════════════════════
 CHAT_SYSTEM = """
 You are an AI tech news assistant. Answer questions about technology concisely.
-If the user asks about today's news, use the context provided.
-Be direct. Keep responses under 200 words unless asked for more.
+Use today's news context when relevant. Be direct. Under 200 words unless asked for more.
 """
 
 def chat_response(messages: list[dict], news_context: str = "") -> str:
@@ -412,7 +404,7 @@ def chat_response(messages: list[dict], news_context: str = "") -> str:
 # ══════════════════════════════════════════════════════════
 def run_pipeline() -> dict:
     memory = ArticleMemory()
-    log.info(f"Pipeline v6 started. Memory: {memory.size()} articles seen.")
+    log.info(f"Pipeline v7 started. Memory: {memory.size()} seen articles.")
 
     raw = fetch_news()
     if not raw:
@@ -436,8 +428,8 @@ def run_pipeline() -> dict:
     if not selected:
         selected = candidates[:TARGET_ARTICLES]
 
-    # ── Parallel: per-article summaries + global digest ──
-    log.info("Generating per-article summaries in parallel...")
+    # Per-article summaries + global digest in parallel
+    log.info("Generating summaries in parallel…")
     with ThreadPoolExecutor(max_workers=4) as executor:
         summary_futures = {
             executor.submit(_summarise_one, a): i
@@ -448,18 +440,13 @@ def run_pipeline() -> dict:
         for future, idx in summary_futures.items():
             try:
                 selected[idx]["ai_summary"] = future.result()
-            except Exception as e:
-                log.warning(f"Per-article summary failed idx={idx}: {e}")
+            except Exception:
                 selected[idx]["ai_summary"] = selected[idx].get("description", "")
 
         global_summary = global_future.result()
 
-    # ── Image enrichment (parallel inside enrich_with_images) ──
-    log.info("Enriching articles with AI-generated images...")
-    selected = enrich_with_images(selected, groq_client=client)
-
     memory.mark_batch([a.get("title", "") for a in selected])
-    log.info(f"Pipeline v6 complete. {len(selected)} articles.")
+    log.info(f"Pipeline v7 complete. {len(selected)} articles.")
 
     return {
         "status":        "ok",
@@ -467,12 +454,13 @@ def run_pipeline() -> dict:
         "article_count": len(selected),
         "articles": [
             {
-                "title":        a.get("title", ""),
-                "description":  a.get("description", ""),
-                "summary":      a.get("ai_summary", ""),
-                "ai_image_url": a.get("ai_image_url", ""),
-                "source_url":   a.get("source_url") or a.get("link", ""),
-                "pubDate":      a.get("pubDate", ""),
+                "title":       a.get("title", ""),
+                "description": a.get("description", ""),
+                "summary":     a.get("ai_summary", ""),
+                # image_url comes directly from NewsData.io — empty string if not provided
+                "image_url":   a.get("image_url") or "",
+                "source_url":  a.get("source_url") or a.get("link", ""),
+                "pubDate":     a.get("pubDate", ""),
             }
             for a in selected
         ],
