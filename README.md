@@ -1,5 +1,17 @@
 # 🚀 AI-Powered Tech News App
 
+🌐 Live Demo: https://ai-news-backend-1nge.onrender.com/api/latest
+
+📰 AI-powered technology news aggregation and summarization platform that collects, processes, and delivers real-time technology updates from global sources.
+
+## Features
+
+- Real-time technology news updates
+- AI-generated news summaries
+- Global technology coverage
+- Category-wise filtering
+- Mobile-friendly interface
+- Automated news collection
 An intelligent Android application that automatically gathers the latest technology news from global sources, processes the information using Artificial Intelligence, and delivers concise, easy-to-understand summaries to users in real time.
 
 The application is designed to help technology enthusiasts, students, researchers, developers, and professionals stay updated with the rapidly evolving world of technology without spending hours reading lengthy articles from multiple websites.
